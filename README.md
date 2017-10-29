@@ -4,8 +4,4 @@
  
 **the project is in progress**
 
-It's working
 
-haha
-ahaha
-haha
