@@ -1,6 +1,6 @@
-# Artificial-Captioner
+# All other files 
 
- we present a model that generates natural language descriptions of images and their regions with the help of Machine Learning algorithm .This project is written on Torch which is faster than python .
+Here all other files will be kept like training file and all
  
 **the project is in progress**
 
