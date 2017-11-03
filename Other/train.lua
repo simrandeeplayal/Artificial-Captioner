@@ -64,3 +64,81 @@ cmd:option('-gpuid', 0, 'which gpu to use. -1 = use CPU')
 
 cmd:text()
 
+
+local opt = cmd:parse(arg)
+torch.manualSeed(opt.seed)
+torch.setdefaulttensortype('torch.FloatTensor') -- for CPU
+
+if opt.gpuid >= 0 then
+  require 'cutorch'
+  require 'cunn'
+  if opt.backend == 'cudnn' then require 'cudnn' end
+  cutorch.manualSeed(opt.seed)
+  cutorch.setDevice(opt.gpuid + 1) -- note +1 because lua is 1-indexed
+end
+
+
+local loader = DataLoader{h5_file = opt.input_h5, json_file = opt.input_json}
+
+
+local protos = {}
+
+if string.len(opt.start_from) > 0 then
+  -- load protos from file
+  print('initializing weights from ' .. opt.start_from)
+  local loaded_checkpoint = torch.load(opt.start_from)
+  protos = loaded_checkpoint.protos
+  net_utils.unsanitize_gradients(protos.cnn)
+  local lm_modules = protos.lm:getModulesList()
+  for k,v in pairs(lm_modules) do net_utils.unsanitize_gradients(v) end
+  protos.crit = nn.LanguageModelCriterion() -- not in checkpoints, create manually
+  protos.expander = nn.FeatExpander(opt.seq_per_img) -- not in checkpoints, create manually
+else
+  -- create protos from scratch
+  -- intialize language model
+  local lmOpt = {}
+  lmOpt.vocab_size = loader:getVocabSize()
+  lmOpt.input_encoding_size = opt.input_encoding_size
+  lmOpt.rnn_size = opt.rnn_size
+  lmOpt.num_layers = 1
+  lmOpt.dropout = opt.drop_prob_lm
+  lmOpt.seq_length = loader:getSeqLength()
+  lmOpt.batch_size = opt.batch_size * opt.seq_per_img
+  protos.lm = nn.LanguageModel(lmOpt)
+
+  local cnn_backend = opt.backend
+  if opt.gpuid == -1 then cnn_backend = 'nn' end 
+  local cnn_raw = loadcaffe.load(opt.cnn_proto, opt.cnn_model, cnn_backend)
+  protos.cnn = net_utils.build_cnn(cnn_raw, {encoding_size = opt.input_encoding_size, backend = cnn_backend})
+ 
+  protos.expander = nn.FeatExpander(opt.seq_per_img)
+  
+  protos.crit = nn.LanguageModelCriterion()
+end
+
+
+if opt.gpuid >= 0 then
+  for k,v in pairs(protos) do v:cuda() end
+end
+
+local params, grad_params = protos.lm:getParameters()
+local cnn_params, cnn_grad_params = protos.cnn:getParameters()
+print('total number of parameters in LM: ', params:nElement())
+print('total number of parameters in CNN: ', cnn_params:nElement())
+assert(params:nElement() == grad_params:nElement())
+assert(cnn_params:nElement() == cnn_grad_params:nElement())
+
+
+local thin_lm = protos.lm:clone()
+thin_lm.core:share(protos.lm.core, 'weight', 'bias') 
+thin_lm.lookup_table:share(protos.lm.lookup_table, 'weight', 'bias')
+local thin_cnn = protos.cnn:clone('weight', 'bias')
+net_utils.sanitize_gradients(thin_cnn)
+local lm_modules = thin_lm:getModulesList()
+for k,v in pairs(lm_modules) do net_utils.sanitize_gradients(v) end
+
+
+protos.lm:createClones()
+
+collectgarbage() 
+
