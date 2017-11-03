@@ -256,3 +256,146 @@ function layer:sample_beam(imgs, opt)
   return seq, seqLogprobs
 end
 
+
+
+
+
+
+function layer:updateOutput(input)
+  local imgs = input[1]
+  local seq = input[2]
+  if self.clones == nil then self:createClones() end 
+  assert(seq:size(1) == self.seq_length)
+  local batch_size = seq:size(2)
+  self.output:resize(self.seq_length+2, batch_size, self.vocab_size+1)
+  
+  self:_createInitState(batch_size)
+
+  self.state = {[0] = self.init_state}
+  self.inputs = {}
+  self.lookup_tables_inputs = {}
+  self.tmax = 0 
+  for t=1,self.seq_length+2 do
+
+    local can_skip = false
+    local xt
+    if t == 1 then
+     
+      xt = imgs 
+    elseif t == 2 then
+      
+      local it = torch.LongTensor(batch_size):fill(self.vocab_size+1)
+      self.lookup_tables_inputs[t] = it
+      xt = self.lookup_tables[t]:forward(it) 
+    else
+   
+      local it = seq[t-2]:clone()
+      if torch.sum(it) == 0 then
+
+        can_skip = true 
+      end
+    
+      it[torch.eq(it,0)] = 1
+
+      if not can_skip then
+        self.lookup_tables_inputs[t] = it
+        xt = self.lookup_tables[t]:forward(it)
+      end
+    end
+
+    if not can_skip then
+     
+      self.inputs[t] = {xt,unpack(self.state[t-1])}
+      
+      local out = self.clones[t]:forward(self.inputs[t])
+      
+      self.output[t] = out[self.num_state+1] 
+      self.state[t] = {} 
+      for i=1,self.num_state do table.insert(self.state[t], out[i]) end
+      self.tmax = t
+    end
+  end
+
+  return self.output
+end
+
+
+function layer:updateGradInput(input, gradOutput)
+  local dimgs 
+
+  local dstate = {[self.tmax] = self.init_state} 
+  for t=self.tmax,1,-1 do
+    
+    local dout = {}
+    for k=1,#dstate[t] do table.insert(dout, dstate[t][k]) end
+    table.insert(dout, gradOutput[t])
+    local dinputs = self.clones[t]:backward(self.inputs[t], dout)
+    
+    local dxt = dinputs[1] 
+    dstate[t-1] = {} 
+    for k=2,self.num_state+1 do table.insert(dstate[t-1], dinputs[k]) end
+    
+    
+    if t == 1 then
+      dimgs = dxt
+    else
+      local it = self.lookup_tables_inputs[t]
+      self.lookup_tables[t]:backward(it, dxt) 
+    end
+  end
+
+  
+  self.gradInput = {dimgs, torch.Tensor()}
+  return self.gradInput
+end
+
+
+local crit, parent = torch.class('nn.LanguageModelCriterion', 'nn.Criterion')
+function crit:__init()
+  parent.__init(self)
+end
+
+
+function crit:updateOutput(input, seq)
+  self.gradInput:resizeAs(input):zero() 
+  local L,N,Mp1 = input:size(1), input:size(2), input:size(3)
+  local D = seq:size(1)
+  assert(D == L-2, 'input Tensor should be 2 larger in time')
+
+  local loss = 0
+  local n = 0
+  for b=1,N do 
+    local first_time = true
+    for t=2,L do 
+     
+      local target_index
+      if t-1 > D then 
+        target_index = 0
+      else
+        target_index = seq[{t-1,b}] 
+      end
+     
+      if target_index == 0 and first_time then
+        target_index = Mp1
+        first_time = false
+      end
+
+     
+      if target_index ~= 0 then
+       
+        loss = loss - input[{ t,b,target_index }] 
+        self.gradInput[{ t,b,target_index }] = -1
+        n = n + 1
+      end
+
+    end
+  end
+  self.output = loss / n 
+  self.gradInput:div(n)
+  return self.output
+end
+
+function crit:updateGradInput(input, seq)
+  return self.gradInput
+end
+
