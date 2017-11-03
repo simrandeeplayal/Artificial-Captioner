@@ -41,3 +41,218 @@ function layer:_createInitState(batch_size)
 end
 
 
+function layer:createClones()
+ 
+  print('constructing clones inside the LanguageModel')
+  self.clones = {self.core}
+  self.lookup_tables = {self.lookup_table}
+  for t=2,self.seq_length+2 do
+    self.clones[t] = self.core:clone('weight', 'bias', 'gradWeight', 'gradBias')
+    self.lookup_tables[t] = self.lookup_table:clone('weight', 'gradWeight')
+  end
+end
+
+function layer:getModulesList()
+  return {self.core, self.lookup_table}
+end
+
+function layer:parameters()
+  
+  local p1,g1 = self.core:parameters()
+  local p2,g2 = self.lookup_table:parameters()
+
+  local params = {}
+  for k,v in pairs(p1) do table.insert(params, v) end
+  for k,v in pairs(p2) do table.insert(params, v) end
+  
+  local grad_params = {}
+  for k,v in pairs(g1) do table.insert(grad_params, v) end
+  for k,v in pairs(g2) do table.insert(grad_params, v) end
+
+ 
+
+  return params, grad_params
+end
+
+function layer:training()
+  if self.clones == nil then self:createClones() end 
+  for k,v in pairs(self.clones) do v:training() end
+  for k,v in pairs(self.lookup_tables) do v:training() end
+end
+
+function layer:evaluate()
+  if self.clones == nil then self:createClones() end 
+  for k,v in pairs(self.clones) do v:evaluate() end
+  for k,v in pairs(self.lookup_tables) do v:evaluate() end
+end
+
+
+function layer:sample(imgs, opt)
+  local sample_max = utils.getopt(opt, 'sample_max', 1)
+  local beam_size = utils.getopt(opt, 'beam_size', 1)
+  local temperature = utils.getopt(opt, 'temperature', 1.0)
+  if sample_max == 1 and beam_size > 1 then return self:sample_beam(imgs, opt) end 
+
+  local batch_size = imgs:size(1)
+  self:_createInitState(batch_size)
+  local state = self.init_state
+
+  
+  local seq = torch.LongTensor(self.seq_length, batch_size):zero()
+  local seqLogprobs = torch.FloatTensor(self.seq_length, batch_size)
+  local logprobs
+  for t=1,self.seq_length+2 do
+
+    local xt, it, sampleLogprobs
+    if t == 1 then
+      
+      xt = imgs
+    elseif t == 2 then
+      
+      it = torch.LongTensor(batch_size):fill(self.vocab_size+1)
+      xt = self.lookup_table:forward(it)
+    else
+     
+      if sample_max == 1 then
+       
+        sampleLogprobs, it = torch.max(logprobs, 2)
+        it = it:view(-1):long()
+      else
+        
+        local prob_prev
+        if temperature == 1.0 then
+          prob_prev = torch.exp(logprobs) 
+        else
+         
+          prob_prev = torch.exp(torch.div(logprobs, temperature))
+        end
+        it = torch.multinomial(prob_prev, 1)
+        sampleLogprobs = logprobs:gather(2, it) 
+        it = it:view(-1):long()
+      end
+      xt = self.lookup_table:forward(it)
+    end
+
+    if t >= 3 then 
+      seq[t-2] = it 
+      seqLogprobs[t-2] = sampleLogprobs:view(-1):float() 
+    end
+
+    local inputs = {xt,unpack(state)}
+    local out = self.core:forward(inputs)
+    logprobs = out[self.num_state+1] 
+    state = {}
+    for i=1,self.num_state do table.insert(state, out[i]) end
+  end
+
+ 
+  return seq, seqLogprobs
+end
+
+function layer:sample_beam(imgs, opt)
+  local beam_size = utils.getopt(opt, 'beam_size', 10)
+  local batch_size, feat_dim = imgs:size(1), imgs:size(2)
+  local function compare(a,b) return a.p > b.p end 
+
+  assert(beam_size <= self.vocab_size+1, 'lets assume this for now, otherwise this corner case causes a few headaches down the road. can be dealt with in future if needed')
+
+  local seq = torch.LongTensor(self.seq_length, batch_size):zero()
+  local seqLogprobs = torch.FloatTensor(self.seq_length, batch_size)
+  
+  for k=1,batch_size do
+
+    
+    self:_createInitState(beam_size)
+    local state = self.init_state
+
+    local beam_seq = torch.LongTensor(self.seq_length, beam_size):zero()
+    local beam_seq_logprobs = torch.FloatTensor(self.seq_length, beam_size):zero()
+    local beam_logprobs_sum = torch.zeros(beam_size) 
+    local logprobs
+    local done_beams = {}
+    for t=1,self.seq_length+2 do
+
+      local xt, it, sampleLogprobs
+      local new_state
+      if t == 1 then
+       
+        local imgk = imgs[{ {k,k} }]:expand(beam_size, feat_dim) 
+        xt = imgk
+      elseif t == 2 then
+        
+        it = torch.LongTensor(beam_size):fill(self.vocab_size+1)
+        xt = self.lookup_table:forward(it)
+      else
+       
+        local logprobsf = logprobs:float() 
+        ys,ix = torch.sort(logprobsf,2,true) 
+        local candidates = {}
+        local cols = math.min(beam_size,ys:size(2))
+        local rows = beam_size
+        if t == 3 then rows = 1 end 
+        for c=1,cols do 
+          for q=1,rows do 
+            local local_logprob = ys[{ q,c }]
+            local candidate_logprob = beam_logprobs_sum[q] + local_logprob
+            table.insert(candidates, {c=ix[{ q,c }], q=q, p=candidate_logprob, r=local_logprob })
+          end
+        end
+        table.sort(candidates, compare) 
+
+        
+        new_state = net_utils.clone_list(state)
+        local beam_seq_prev, beam_seq_logprobs_prev
+        if t > 3 then
+          
+          beam_seq_prev = beam_seq[{ {1,t-3}, {} }]:clone()
+          beam_seq_logprobs_prev = beam_seq_logprobs[{ {1,t-3}, {} }]:clone()
+        end
+        for vix=1,beam_size do
+          local v = candidates[vix]
+          
+          if t > 3 then
+            beam_seq[{ {1,t-3}, vix }] = beam_seq_prev[{ {}, v.q }]
+            beam_seq_logprobs[{ {1,t-3}, vix }] = beam_seq_logprobs_prev[{ {}, v.q }]
+          end
+          
+          for state_ix = 1,#new_state do
+            
+            new_state[state_ix][vix] = state[state_ix][v.q]
+          end
+          
+          beam_seq[{ t-2, vix }] = v.c 
+          beam_seq_logprobs[{ t-2, vix }] = v.r 
+          beam_logprobs_sum[vix] = v.p 
+
+          if v.c == self.vocab_size+1 or t == self.seq_length+2 then
+            
+            table.insert(done_beams, {seq = beam_seq[{ {}, vix }]:clone(), 
+                                      logps = beam_seq_logprobs[{ {}, vix }]:clone(),
+                                      p = beam_logprobs_sum[vix]
+                                     })
+          end
+        end
+        
+        
+        it = beam_seq[t-2]
+        xt = self.lookup_table:forward(it)
+      end
+
+      if new_state then state = new_state end 
+
+      local inputs = {xt,unpack(state)}
+      local out = self.core:forward(inputs)
+      logprobs = out[self.num_state+1]
+      state = {}
+      for i=1,self.num_state do table.insert(state, out[i]) end
+    end
+
+    table.sort(done_beams, compare)
+    seq[{ {}, k }] = done_beams[1].seq 
+    seqLogprobs[{ {}, k }] = done_beams[1].logps
+  end
+
+ 
+  return seq, seqLogprobs
+end
+
