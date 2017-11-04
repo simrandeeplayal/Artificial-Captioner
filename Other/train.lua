@@ -141,4 +141,27 @@ for k,v in pairs(lm_modules) do net_utils.sanitize_gradients(v) end
 protos.lm:createClones()
 
 collectgarbage() 
+local function eval_split(split, evalopt)
+  local verbose = utils.getopt(evalopt, 'verbose', true)
+  local val_images_use = utils.getopt(evalopt, 'val_images_use', true)
+
+  protos.cnn:evaluate()
+  protos.lm:evaluate()
+  loader:resetIterator(split) 
+  local n = 0
+  local loss_sum = 0
+  local loss_evals = 0
+  local predictions = {}
+  local vocab = loader:getVocab()
+  while true do
+  local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
+    data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0) 
+    n = n + data.images:size(1)
+
+    local feats = protos.cnn:forward(data.images)
+    local expanded_feats = protos.expander:forward(feats)
+    local logprobs = protos.lm:forward{expanded_feats, data.labels}
+    local loss = protos.crit:forward(logprobs, data.labels)
+    loss_sum = loss_sum + loss
+    loss_evals = loss_evals + 1
 
