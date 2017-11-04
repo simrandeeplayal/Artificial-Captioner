@@ -196,5 +196,50 @@ if loss_evals % 10 == 0 then collectgarbage() end
   return loss_sum/loss_evals, predictions, lang_stats
 end
 
+local iter = 0
+local function lossFun()
+  protos.cnn:training()
+  protos.lm:training()
+  grad_params:zero()
+  if opt.finetune_cnn_after >= 0 and iter >= opt.finetune_cnn_after then
+    cnn_grad_params:zero()
+  end
+local data = loader:getBatch{batch_size = opt.batch_size, split = 'train', seq_per_img = opt.seq_per_img}
+  data.images = net_utils.prepro(data.images, true, opt.gpuid >= 0)
+local feats = protos.cnn:forward(data.images)
+
+local expanded_feats = protos.expander:forward(feats)
+
+local logprobs = protos.lm:forward{expanded_feats, data.labels}
+
+local loss = protos.crit:forward(logprobs, data.labels)
+local dlogprobs = protos.crit:backward(logprobs, data.labels)
+
+local dexpanded_feats, ddummy = unpack(protos.lm:backward({expanded_feats, data.labels}, dlogprobs))
+
+ if opt.finetune_cnn_after >= 0 and iter >= opt.finetune_cnn_after then
+    local dfeats = protos.expander:backward(feats, dexpanded_feats)
+    local dx = protos.cnn:backward(data.images, dfeats)
+  end
+
+grad_params:clamp(-opt.grad_clip, opt.grad_clip)
+
+if opt.cnn_weight_decay > 0 then
+    cnn_grad_params:add(opt.cnn_weight_decay, cnn_params)
+
+ cnn_grad_params:clamp(-opt.grad_clip, opt.grad_clip)
+  end
+local losses = { total_loss = loss }
+  return losses
+end
+
+local loss0
+local optim_state = {}
+local cnn_optim_state = {}
+local loss_history = {}
+local val_lang_stats_history = {}
+local val_loss_history = {}
+local best_score
+while true do  
 
 
