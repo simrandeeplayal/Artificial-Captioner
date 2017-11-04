@@ -242,4 +242,107 @@ local val_loss_history = {}
 local best_score
 while true do  
 
+ local losses = lossFun()
+  if iter % opt.losses_log_every == 0 then loss_history[iter] = losses.total_loss end
+  print(string.format('iter %d: %f', iter, losses.total_loss))
+
+if (iter % opt.save_checkpoint_every == 0 or iter == opt.max_iters) then
+
+ local val_loss, val_predictions, lang_stats = eval_split('val', {val_images_use = opt.val_images_use})
+    print('validation loss: ', val_loss)
+    print(lang_stats)
+    val_loss_history[iter] = val_loss
+    if lang_stats then
+      val_lang_stats_history[iter] = lang_stats
+    end
+
+    local checkpoint_path = path.join(opt.checkpoint_path, 'model_id' .. opt.id)
+
+local checkpoint = {}
+    checkpoint.opt = opt
+    checkpoint.iter = iter
+    checkpoint.loss_history = loss_history
+    checkpoint.val_loss_history = val_loss_history
+    checkpoint.val_predictions = val_predictions
+
+checkpoint.val_lang_stats_history = val_lang_stats_history
+
+    utils.write_json(checkpoint_path .. '.json', checkpoint)
+    print('wrote json checkpoint to ' .. checkpoint_path .. '.json')
+
+local current_score
+    if lang_stats then
+ current_score = lang_stats['CIDEr']
+    else
+ current_score = -val_loss
+    end
+    if best_score == nil or current_score > best_score then
+      best_score = current_score
+      if iter > 0 then
+
+ local save_protos = {}
+        save_protos.lm = thin_lm 
+save_protos.cnn = thin_cnn
+        checkpoint.protos = save_protos
+
+ checkpoint.vocab = loader:getVocab()
+        torch.save(checkpoint_path .. '.t7', checkpoint)
+        print('wrote checkpoint to ' .. checkpoint_path .. '.t7')
+      end
+    end
+  end
+
+local learning_rate = opt.learning_rate
+  local cnn_learning_rate = opt.cnn_learning_rate
+  if iter > opt.learning_rate_decay_start and opt.learning_rate_decay_start >= 0 then
+    local frac = (iter - opt.learning_rate_decay_start) / opt.learning_rate_decay_every
+    local decay_factor = math.pow(0.5, frac)
+    learning_rate = learning_rate * decay_factor
+
+ cnn_learning_rate = cnn_learning_rate * decay_factor
+  end
+
+if opt.optim == 'rmsprop' then
+    rmsprop(params, grad_params, learning_rate, opt.optim_alpha, opt.optim_epsilon, optim_state)
+  elseif opt.optim == 'adagrad' then
+    adagrad(params, grad_params, learning_rate, opt.optim_epsilon, optim_state)
+  elseif opt.optim == 'sgd' then
+    sgd(params, grad_params, opt.learning_rate)
+  elseif opt.optim == 'sgdm' then
+    sgdm(params, grad_params, learning_rate, opt.optim_alpha, optim_state)
+  elseif opt.optim == 'sgdmom' then
+    sgdmom(params, grad_params, learning_rate, opt.optim_alpha, optim_state)
+  elseif opt.optim == 'adam' then
+    adam(params, grad_params, learning_rate, opt.optim_alpha, opt.optim_beta, opt.optim_epsilon, optim_state)
+  else
+    error('bad option opt.optim')
+  end
+
+if opt.finetune_cnn_after >= 0 and iter >= opt.finetune_cnn_after then
+    if opt.cnn_optim == 'sgd' then
+      sgd(cnn_params, cnn_grad_params, cnn_learning_rate)
+    elseif opt.cnn_optim == 'sgdm' then
+      sgdm(cnn_params, cnn_grad_params, cnn_learning_rate, opt.cnn_optim_alpha, cnn_optim_state)
+    elseif opt.cnn_optim == 'adam' then
+      adam(cnn_params, cnn_grad_params, cnn_learning_rate, opt.cnn_optim_alpha, opt.cnn_optim_beta, opt.optim_epsilon, cnn_optim_state)
+    else
+      error('bad option for opt.cnn_optim')
+    end
+  end
+
+iter = iter + 1
+  if iter % 10 == 0 then collectgarbage() end -- good idea to do this once in a while, i think
+  if loss0 == nil then loss0 = losses.total_loss end
+  if losses.total_loss > loss0 * 20 then
+    print('loss seems to be exploding, quitting.')
+    break
+  end
+  if opt.max_iters > 0 and iter >= opt.max_iters then break end -- stopping criterion
+
+end
+
+
+
+
+
 
