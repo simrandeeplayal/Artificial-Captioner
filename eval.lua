@@ -61,3 +61,97 @@ end
 local vocab = checkpoint.vocab 
 
 
+local loader
+if string.len(opt.image_folder) == 0 then
+  loader = DataLoader{h5_file = opt.input_h5, json_file = opt.input_json}
+else
+  loader = DataLoaderRaw{folder_path = opt.image_folder, coco_json = opt.coco_json}
+end
+
+
+local protos = checkpoint.protos
+protos.expander = nn.FeatExpander(opt.seq_per_img)
+protos.crit = nn.LanguageModelCriterion()
+protos.lm:createClones() 
+if opt.gpuid >= 0 then for k,v in pairs(protos) do v:cuda() end end
+
+
+local function eval_split(split, evalopt)
+  local verbose = utils.getopt(evalopt, 'verbose', true)
+  local num_images = utils.getopt(evalopt, 'num_images', true)
+
+  protos.cnn:evaluate()
+  protos.lm:evaluate()
+  loader:resetIterator(split)
+  local n = 0
+  local loss_sum = 0
+  local loss_evals = 0
+  local predictions = {}
+  while true do
+
+
+    local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
+    data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0) 
+    n = n + data.images:size(1)
+
+
+    local feats = protos.cnn:forward(data.images)
+
+    local loss = 0
+    if data.labels then
+      local expanded_feats = protos.expander:forward(feats)
+      local logprobs = protos.lm:forward{expanded_feats, data.labels}
+      loss = protos.crit:forward(logprobs, data.labels)
+      loss_sum = loss_sum + loss
+      loss_evals = loss_evals + 1
+    end
+
+    local sample_opts = { sample_max = opt.sample_max, beam_size = opt.beam_size, temperature = opt.temperature }
+    local seq = protos.lm:sample(feats, sample_opts)
+    local sents = net_utils.decode_sequence(vocab, seq)
+    for k=1,#sents do
+      local entry = {image_id = data.infos[k].id, caption = sents[k]}
+      if opt.dump_path == 1 then
+        entry.file_name = data.infos[k].file_path
+      end
+      table.insert(predictions, entry)
+      if opt.dump_images == 1 then
+
+        local cmd = 'cp "' .. path.join(opt.image_root, data.infos[k].file_path) .. '" vis/imgs/img' .. #predictions .. '.jpg' 
+        print(cmd)
+        os.execute(cmd) 
+      end
+      if verbose then
+        print(string.format('image %s: %s', entry.image_id, entry.caption))
+      end
+    end
+
+       local ix0 = data.bounds.it_pos_now
+    local ix1 = math.min(data.bounds.it_max, num_images)
+    if verbose then
+      print(string.format('evaluating performance... %d/%d (%f)', ix0-1, ix1, loss))
+    end
+
+    if data.bounds.wrapped then break end 
+    if num_images >= 0 and n >= num_images then break end 
+  end
+
+  local lang_stats
+  if opt.language_eval == 1 then
+    lang_stats = net_utils.language_eval(predictions, opt.id)
+  end
+
+  return loss_sum/loss_evals, predictions, lang_stats
+end
+
+local loss, split_predictions, lang_stats = eval_split(opt.split, {num_images = opt.num_images})
+print('loss: ', loss)
+if lang_stats then
+  print(lang_stats)
+end
+
+if opt.dump_json == 1 then
+  -- dump the json
+  utils.write_json('vis/vis.json', split_predictions)
+end
+
