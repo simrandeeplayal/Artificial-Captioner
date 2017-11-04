@@ -165,3 +165,36 @@ local function eval_split(split, evalopt)
     loss_sum = loss_sum + loss
     loss_evals = loss_evals + 1
 
+local seq = protos.lm:sample(feats)
+    local sents = net_utils.decode_sequence(vocab, seq)
+    for k=1,#sents do
+      local entry = {image_id = data.infos[k].id, caption = sents[k]}
+      table.insert(predictions, entry)
+      if verbose then
+        print(string.format('image %s: %s', entry.image_id, entry.caption))
+      end
+    end
+
+    
+    local ix0 = data.bounds.it_pos_now
+    local ix1 = math.min(data.bounds.it_max, val_images_use)
+    if verbose then
+      print(string.format('evaluating validation performance... %d/%d (%f)', ix0-1, ix1, loss))
+    end
+
+
+if loss_evals % 10 == 0 then collectgarbage() end
+    if data.bounds.wrapped then break end 
+    if n >= val_images_use then break end 
+  end
+
+  local lang_stats
+  if opt.language_eval == 1 then
+    lang_stats = net_utils.language_eval(predictions, opt.id)
+  end
+
+  return loss_sum/loss_evals, predictions, lang_stats
+end
+
+
+
