@@ -64,4 +64,3 @@ function LSTM.lstm(input_size, output_size, rnn_size, n, dropout)
 end
 
 return LSTM
-
